@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dslabs trace viewer</title>
+<style>
+  :root { --deliver:#2b6cb0; --duplicate:#dd6b20; --drop:#c53030; --client:#2f855a; --timer:#805ad5;
+          --state:#1a202c; --note:#4a5568; --edge:#e2e8f0; --muted:#718096; --bg:#ffffff; --panel:#f7fafc; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif; font-size:14px; color:var(--state);
+         background:var(--bg); display:flex; flex-direction:column; height:100vh; }
+  header { display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid var(--edge); flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0 6px 0 0; }
+  #info { color:var(--muted); font-size:12px; margin-right:auto; }
+  main { display:flex; flex:1; min-height:0; }
+  #stage { flex:1; min-width:0; position:relative; }
+  #stage svg { width:100%; height:100%; display:block; }
+  aside { width:380px; border-left:1px solid var(--edge); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
+  aside h2 { font-size:12px; margin:0; padding:8px 12px; border-bottom:1px solid var(--edge); color:var(--muted);
+             font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  #log { overflow:auto; flex:1; margin:0; padding:4px 0; list-style:none; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  #log li { padding:2px 12px; cursor:pointer; color:#a0aec0; white-space:nowrap; }
+  #log li.past { color:var(--state); }
+  #log li.current { background:#ebf8ff; }
+  #log li.timer { font-style:italic; }
+  #log li.hidden { display:none; }
+  #log li .t { display:inline-block; width:66px; text-align:right; margin-right:8px; color:var(--muted); }
+  #log li .k { display:inline-block; width:58px; color:var(--muted); }
+  footer { padding:6px 14px; border-top:1px solid var(--edge); font-size:12px; color:var(--muted); display:flex; gap:18px; flex-wrap:wrap; }
+  footer span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:-1px; background:var(--c); }
+  button { font:inherit; padding:3px 10px; }
+  #time { font-family:ui-monospace,Menlo,Consolas,monospace; min-width:100px; text-align:right; }
+  #slider { flex:1 1 120px; min-width:100px; }
+  label.small { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:4px; }
+  #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted);
+           font-size:16px; text-align:center; padding:40px; line-height:1.5; }
+  #empty p { max-width:560px; margin:0; }
+  #empty.hidden { display:none; }
+  body.dragover { outline:4px dashed var(--deliver); outline-offset:-4px; }
+  .halo { paint-order:stroke; stroke:#fff; stroke-width:3px; stroke-linejoin:round; }
+</style>
+</head>
+<body>
+<header>
+  <h1>dslabs trace viewer</h1>
+  <span id="info"></span>
+  <input type="file" id="file" accept=".json,application/json" title="load an exported trace">
+  <button id="prev" title="previous event (←)">⏮</button>
+  <button id="play" title="play / pause (space)">▶ Play</button>
+  <button id="next" title="next event (→)">⏭</button>
+  <span id="time">t = 0 ms</span>
+  <input type="range" id="slider" min="0" max="1" value="0" step="1">
+  <label class="small">speed <select id="speed"></select></label>
+  <label class="small"><input type="checkbox" id="labels" checked> labels</label>
+  <label class="small"><input type="checkbox" id="showtimers" checked> timers</label>
+</header>
+<main>
+  <div id="stage">
+    <svg id="svg" viewBox="0 0 800 600" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="empty"><p>Load a trace: choose a file above, or drop a <code>.json</code> written by
+      <code>trace.save_json(...)</code> anywhere on this page.<br>
+      Space plays and pauses, the arrow keys step between events, the slider scrubs.</p></div>
+  </div>
+  <aside>
+    <h2>Events</h2>
+    <ol id="log"></ol>
+  </aside>
+</main>
+<footer>
+  <span style="--c:var(--deliver)">message in flight</span>
+  <span style="--c:var(--duplicate)">duplicate copy</span>
+  <span style="--c:var(--drop)">dropped</span>
+  <span style="--c:var(--client)">client request</span>
+  <span style="--c:var(--timer)">timer</span>
+</footer>
+
+<script id="dslabs-trace" type="application/json">/*DSLABS_TRACE_PLACEHOLDER*/</script>
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const SVG = "http://www.w3.org/2000/svg";
+  const COLOR = { deliver: "#2b6cb0", duplicate: "#dd6b20", drop: "#c53030", client: "#2f855a",
+                  timer: "#805ad5", state: "#1a202c", note: "#4a5568", edge: "#e2e8f0", idle: "#cbd5e0" };
+  const SPEEDS = [0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10];   // simulated ms per real ms
+  const TIMER_KINDS = new Set(["timer_set", "timer_fired", "timer_cancelled"]);
+  const NODE_R = 28, DOT_R = 6;   // a message travels from the rim of one node to the rim of the other
+
+  // The whole viewer is a pure function of (trace, t): every frame recomputes what is
+  // in flight and what each node shows, so scrubbing backwards works for free.
+  const view = { trace: null, events: [], messages: [], nodes: [], pos: {}, t: 0, end: 1,
+                 playing: false, speed: 0.1, lastFrame: 0, flashWindow: 50 };
+
+  // ---- describing events (mirrors dslabs/trace.py) ------------------------------
+  function describe(msg) {
+    const parts = [];
+    if ("type" in msg) parts.push(String(msg.type));
+    const rest = Object.assign({}, msg); delete rest.type; delete rest.from;
+    if ("key" in rest && "value" in rest) { parts.push(`${rest.key}=${fmt(rest.value)}`); delete rest.key; delete rest.value; }
+    for (const k of Object.keys(rest)) parts.push(`${k}=${fmt(rest[k])}`);
+    return parts.join(" ") || "{}";
+  }
+  function fmt(v) { return (v !== null && typeof v === "object") ? JSON.stringify(v) : String(v); }
+  function describeState(state) { return Object.keys(state).map(k => `${k}=${fmt(state[k])}`).join(" ") || "{}"; }
+  function detail(ev) {
+    switch (ev.kind) {
+      case "send": return `#${ev.msg_id} ${describe(ev.msg)}`;
+      case "deliver": return `#${ev.msg_id} ${describe(ev.msg)}  (+${ev.delay_ms} ms)`;
+      case "drop": return `#${ev.msg_id} ${describe(ev.msg)}  dropped by ${ev.rule}`;
+      case "timer_set": return `set ${ev.text}, due @ ${ev.due_ms} ms`;
+      case "timer_fired": return `fired ${ev.text}`;
+      case "timer_cancelled": return `cancelled ${ev.text}`;
+      case "state": return describeState(ev.state);
+      default: return ev.text || "";
+    }
+  }
+  const place = (ev) => ev.frm ? `${ev.frm} -> ${ev.to}` : (ev.node || "");
+  const kindLabel = (k) => TIMER_KINDS.has(k) ? "timer" : k;
+
+  // ---- loading -------------------------------------------------------------------
+  function load(trace) {
+    view.trace = trace;
+    view.events = trace.events.slice().sort((a, b) => a.t_ms - b.t_ms);
+    view.nodes = trace.nodes.slice();
+    for (const ev of view.events) for (const n of [ev.frm, ev.to, ev.node]) if (n && !view.nodes.includes(n)) view.nodes.push(n);
+    const byId = new Map();
+    for (const ev of view.events) {
+      if (ev.kind === "send") byId.set(ev.msg_id, { id: ev.msg_id, frm: ev.frm, to: ev.to, sent: ev.t_ms, msg: ev.msg, deliveries: [], drops: [] });
+      else if (ev.kind === "deliver") byId.get(ev.msg_id).deliveries.push(ev.t_ms);
+      else if (ev.kind === "drop") byId.get(ev.msg_id).drops.push({ delay: ev.delay_ms, rule: ev.rule });
+    }
+    view.messages = [...byId.values()];
+    for (const m of view.messages) m.deliveries.sort((a, b) => a - b);
+    const last = Math.max(0, ...view.events.map(e => e.t_ms), ...view.messages.flatMap(m => m.drops.map(d => m.sent + d.delay)));
+    view.end = Math.max(1, trace.end_ms || 0, last);
+    view.flashWindow = Math.max(20, Math.round(view.end * 0.03));
+    view.speed = SPEEDS.filter(s => view.end / s >= 8000).pop() || SPEEDS[0];   // a run lasts about 8 s or more
+    $("speed").value = String(view.speed);
+    $("slider").max = String(view.end);
+    $("info").textContent = `${view.nodes.length} nodes · ${view.messages.length} messages · ${view.events.length} events · ${view.end} ms`;
+    layout(); buildStage(); buildLog();
+    $("empty").classList.add("hidden");
+    const m = /t=(\d+)/.exec(location.hash);
+    seek(m ? Math.min(view.end, +m[1]) : 0);
+  }
+
+  // ---- layout: nodes on a ring -----------------------------------------------------
+  function layout() {
+    const n = view.nodes.length, cx = 400, cy = 300, r = n === 1 ? 0 : Math.min(220, 90 + 25 * n);
+    view.nodes.forEach((id, i) => {
+      const a = -Math.PI / 2 + (2 * Math.PI * i) / n;
+      view.pos[id] = { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+    });
+  }
+
+  // ---- static SVG: edges and node groups ------------------------------------------
+  const el = (tag, attrs, parent) => {
+    const e = document.createElementNS(SVG, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  };
+  const nodeEls = {};
+  let dotsLayer;
+  function buildStage() {
+    const svg = $("svg"); svg.innerHTML = "";
+    const edges = el("g", {}, svg);
+    for (let i = 0; i < view.nodes.length; i++) for (let j = i + 1; j < view.nodes.length; j++) {
+      const a = view.pos[view.nodes[i]], b = view.pos[view.nodes[j]];
+      el("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y, stroke: COLOR.edge, "stroke-width": 1.5 }, edges);
+    }
+    dotsLayer = el("g", {}, svg);
+    const nodes = el("g", {}, svg);
+    for (const id of view.nodes) {
+      const p = view.pos[id];
+      const g = el("g", { transform: `translate(${p.x},${p.y})` }, nodes);
+      const ring = el("circle", { r: 34, fill: "none", stroke: "transparent", "stroke-width": 6 }, g);
+      const circle = el("circle", { r: NODE_R, fill: "#fff", stroke: COLOR.idle, "stroke-width": 2 }, g);
+      const label = el("text", { y: 5, "text-anchor": "middle", "font-size": 15, "font-weight": "bold", fill: COLOR.state }, g);
+      label.textContent = id;
+      const client = el("text", { y: -42, "text-anchor": "middle", "font-size": 12, fill: COLOR.client, class: "halo" }, g);
+      const note = el("text", { y: -58, "text-anchor": "middle", "font-size": 11, fill: COLOR.note, "font-style": "italic", class: "halo" }, g);
+      const state = el("text", { y: 48, "text-anchor": "middle", "font-size": 12, fill: COLOR.state, class: "halo" }, g);
+      const timers = el("text", { y: 63, "text-anchor": "middle", "font-size": 11, fill: COLOR.timer, class: "halo" }, g);
+      nodeEls[id] = { ring, circle, client, note, state, timers };
+    }
+  }
+
+  function buildLog() {
+    const log = $("log"); log.innerHTML = "";
+    view.events.forEach((ev, i) => {
+      const li = document.createElement("li");
+      li.dataset.t = ev.t_ms; li.dataset.i = i;
+      if (TIMER_KINDS.has(ev.kind)) li.classList.add("timer");
+      li.innerHTML = `<span class="t">${ev.t_ms} ms</span><span class="k">${kindLabel(ev.kind)}</span>${esc(place(ev))}  ${esc(detail(ev))}`;
+      li.addEventListener("click", () => { pause(); seek(ev.t_ms); });
+      log.appendChild(li);
+    });
+    applyLogFilter();
+  }
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  function applyLogFilter() {
+    const show = $("showtimers").checked;
+    for (const li of $("log").children) li.classList.toggle("hidden", !show && li.classList.contains("timer"));
+  }
+
+  // ---- time-dependent queries --------------------------------------------------------
+  function latest(node, t, kind) {
+    let found = null;
+    for (const ev of view.events) { if (ev.t_ms > t) break; if (ev.node === node && ev.kind === kind) found = ev; }
+    return found;
+  }
+  function pendingTimers(node, t) {
+    const open = new Map();
+    for (const ev of view.events) {
+      if (ev.t_ms > t) break;
+      if (ev.node !== node) continue;
+      if (ev.kind === "timer_set") open.set(ev.timer_id, ev);
+      else if (ev.kind === "timer_fired" || ev.kind === "timer_cancelled") open.delete(ev.timer_id);
+    }
+    return [...open.values()];
+  }
+  function flash(node, t) {   // what most recently happened at this node, within the flash window
+    let kind = null;
+    for (const ev of view.events) {
+      if (ev.t_ms > t) break;
+      if (ev.t_ms < t - view.flashWindow) continue;
+      if (ev.kind === "deliver" && ev.to === node) kind = "deliver";
+      else if (ev.kind === "client" && ev.node === node) kind = "client";
+      else if (ev.kind === "timer_fired" && ev.node === node) kind = "timer";
+    }
+    return kind;
+  }
+
+  // ---- render one frame ---------------------------------------------------------------
+  function render() {
+    const t = view.t, labels = $("labels").checked;
+    $("time").textContent = `t = ${Math.round(t)} ms`;
+    $("slider").value = String(Math.round(t));
+
+    // Messages in flight, one dot per copy that will be delivered, plus the dropped copies
+    dotsLayer.innerHTML = "";
+    for (const m of view.messages) {
+      const a0 = view.pos[m.frm], b0 = view.pos[m.to];
+      if (!a0 || !b0 || t < m.sent) continue;
+      // Shorten the path so the dot starts just outside the sender and ends just outside the receiver
+      const dx = b0.x - a0.x, dy = b0.y - a0.y, dist = Math.hypot(dx, dy), gap = NODE_R + DOT_R;
+      if (dist <= 2 * gap) continue;   // a node messaging itself, or nodes too close to draw between
+      const ux = dx / dist, uy = dy / dist;
+      const a = { x: a0.x + ux * gap, y: a0.y + uy * gap }, b = { x: b0.x - ux * gap, y: b0.y - uy * gap };
+      m.deliveries.forEach((td, i) => {
+        if (t >= td) return;
+        const f = (t - m.sent) / (td - m.sent);
+        dot(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, i > 0 ? COLOR.duplicate : COLOR.deliver, m, labels, null);
+      });
+      for (const d of m.drops) {
+        if (t >= m.sent + d.delay) continue;
+        const f = Math.min(0.5, (t - m.sent) / d.delay);
+        const x = a.x + (b.x - a.x) * f, y = a.y + (b.y - a.y) * f;
+        if (f < 0.5) dot(x, y, COLOR.deliver, m, labels, null);
+        else cross(x, y, m, d.rule, labels);
+      }
+    }
+
+    // Nodes: highlight ring, client request, state, pending timers, latest note
+    for (const id of view.nodes) {
+      const e = nodeEls[id], k = flash(id, t);
+      e.circle.setAttribute("stroke", k ? COLOR[k] : COLOR.idle);
+      e.ring.setAttribute("stroke", k ? COLOR[k] + "55" : "transparent");
+      const client = latest(id, t, "client");
+      e.client.textContent = client && client.t_ms >= t - view.flashWindow ? client.text : "";
+      const st = latest(id, t, "state");
+      e.state.textContent = st ? describeState(st.state) : "";
+      const timers = pendingTimers(id, t);
+      e.timers.textContent = timers.map(tm => `⏱ ${tm.text} in ${Math.max(0, Math.round(tm.due_ms - t))} ms`).join("  ");
+      const note = latest(id, t, "note");
+      e.note.textContent = note && note.t_ms >= t - view.flashWindow * 4 ? note.text : "";
+    }
+
+    // Event log: mark the past, keep the latest past event in view
+    let current = null;
+    for (const li of $("log").children) {
+      const past = +li.dataset.t <= t;
+      li.classList.toggle("past", past);
+      li.classList.remove("current");
+      if (past && !li.classList.contains("hidden")) current = li;
+    }
+    if (current) { current.classList.add("current"); if (view.playing) current.scrollIntoView({ block: "nearest" }); }
+  }
+  function dot(x, y, color, m, labels, title) {
+    const g = el("g", {}, dotsLayer);
+    el("circle", { cx: x, cy: y, r: DOT_R, fill: color }, g);
+    el("title", {}, g).textContent = `#${m.id} ${m.frm} -> ${m.to}: ${describe(m.msg)} (sent @ ${m.sent} ms)`;
+    if (labels) { const tx = el("text", { x: x + 9, y: y - 8, "font-size": 11, fill: color, class: "halo" }, g); tx.textContent = describe(m.msg); }
+  }
+  function cross(x, y, m, rule, labels) {
+    const g = el("g", { stroke: COLOR.drop, "stroke-width": 2.5 }, dotsLayer);
+    el("path", { d: `M${x - 6},${y - 6} l12,12 M${x + 6},${y - 6} l-12,12` }, g);
+    el("title", {}, g).textContent = `#${m.id} ${m.frm} -> ${m.to}: ${describe(m.msg)} dropped by ${rule}`;
+    if (labels) { const tx = el("text", { x: x + 10, y: y - 8, "font-size": 11, fill: COLOR.drop, stroke: "none", class: "halo" }, g); tx.textContent = `${describe(m.msg)} ✗ ${rule}`; }
+  }
+
+  // ---- playback -------------------------------------------------------------------------
+  function seek(t) { view.t = Math.max(0, Math.min(view.end, t)); render(); }
+  function play() {
+    if (!view.trace) return;
+    if (view.t >= view.end) view.t = 0;
+    view.playing = true; $("play").textContent = "❚❚ Pause"; view.lastFrame = performance.now();
+    requestAnimationFrame(tick);
+  }
+  function pause() { view.playing = false; $("play").textContent = "▶ Play"; }
+  function tick(now) {
+    if (!view.playing) return;
+    view.t = Math.min(view.end, view.t + (now - view.lastFrame) * view.speed);
+    view.lastFrame = now;
+    render();
+    if (view.t >= view.end) pause(); else requestAnimationFrame(tick);
+  }
+  function eventTimes() {
+    const show = $("showtimers").checked;
+    return [...new Set(view.events.filter(ev => show || !TIMER_KINDS.has(ev.kind)).map(ev => ev.t_ms))];
+  }
+  function stepEvent(dir) {
+    if (!view.trace) return;
+    pause();
+    const times = eventTimes();
+    const next = dir > 0 ? times.find(x => x > view.t) : times.filter(x => x < view.t).pop();
+    seek(next === undefined ? (dir > 0 ? view.end : 0) : next);
+  }
+
+  // ---- wiring ------------------------------------------------------------------------------
+  for (const s of SPEEDS) { const o = document.createElement("option"); o.value = String(s); o.textContent = `${s}×`; $("speed").appendChild(o); }
+  $("speed").addEventListener("change", () => { view.speed = +$("speed").value; });
+  $("play").addEventListener("click", () => view.playing ? pause() : play());
+  $("prev").addEventListener("click", () => stepEvent(-1));
+  $("next").addEventListener("click", () => stepEvent(+1));
+  $("slider").addEventListener("input", () => { pause(); seek(+$("slider").value); });
+  $("labels").addEventListener("change", render);
+  $("showtimers").addEventListener("change", () => { applyLogFilter(); render(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if (e.code === "Space") { e.preventDefault(); view.playing ? pause() : play(); }
+    else if (e.code === "ArrowRight") stepEvent(+1);
+    else if (e.code === "ArrowLeft") stepEvent(-1);
+    else if (e.code === "Home") { pause(); seek(0); }
+    else if (e.code === "End") { pause(); seek(view.end); }
+  });
+
+  function loadFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { load(JSON.parse(reader.result)); }
+      catch (err) { alert(`Could not read ${file.name}: ${err.message}`); }
+    };
+    reader.readAsText(file);
+  }
+  $("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  document.addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("dragover"); });
+  document.addEventListener("dragleave", () => document.body.classList.remove("dragover"));
+  document.addEventListener("drop", (e) => {
+    e.preventDefault(); document.body.classList.remove("dragover");
+    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+  });
+
+  // A trace embedded by trace.save_viewer(...) plays without any file picking
+  const embedded = $("dslabs-trace").textContent.trim();
+  if (embedded && !embedded.startsWith("/*")) {
+    try { load(JSON.parse(embedded)); } catch (err) { console.error("embedded trace is not valid JSON", err); }
+  }
+})();
+</script>
+</body>
+</html>
